@@ -10,14 +10,24 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.logging_setup import configure_logging, get_logger
+from app.logging_setup import configure_logging, get_logger, unify_uvicorn_logging
 from app.middleware import ObservabilityMiddleware
 from app.routes import router
 
 logger = get_logger("app.startup")
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # uvicorn 在启动时才应用自己的 logging 配置（明文 handler），
+    # 这里在其之后把服务器日志统一并入 JSON 管道。
+    unify_uvicorn_logging()
+    yield
 
 
 def create_app() -> FastAPI:
@@ -27,7 +37,8 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="fastapi-observability-tracing-python",
         version="0.1.0",
-        description="本地可观测性（关联 ID / 结构化日志 / 指标）演示服务",
+        description="本地可观测性（关联 ID / 结构化日志 / 指标 / 事后时间线）演示服务",
+        lifespan=_lifespan,
     )
     app.add_middleware(ObservabilityMiddleware)
     app.include_router(router)

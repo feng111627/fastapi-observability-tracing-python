@@ -4,14 +4,18 @@
 1. 从入站 ``X-Correlation-ID`` 头沿用关联 ID，缺失则生成；
 2. 绑定到当前 :class:`contextvars.ContextVar`（响应头原样回传，
    后台任务/异步并发自动拷贝上下文，不串号）；
-3. 进行中请求数 +1，记录开始时间；
-4. 调用下游；抛出的未处理异常在此记录**完整异常链**与脱敏请求头，并兜底
+3. 在 :data:`app.tracing.trace_store` 开立本条关联 ID 的时间线，
+   处理期间的日志事件由日志管道自动归档进去；
+4. 业务请求：进行中请求数 +1，记录开始时间；
+5. 调用下游；抛出的未处理异常在此记录**完整异常链**与脱敏请求头，并兜底
    生成带关联 ID 的 JSON 500 响应（新版 Starlette 异常会穿透 call_next）；
-5. 无论成功失败都：进行中请求数 -1、按状态码/异常类型记录指标、
-   输出一条带 method/path/status_code/duration_ms 的结构化访问日志，
-   最后恢复上下文。
+6. 无论成功失败都：业务请求做指标与访问日志，随后落定时间线的
+   状态码/错误类型/总耗时，最后恢复上下文。
 
-``/healthz``、``/metrics`` 等平台端点不纳入业务指标与访问日志。
+关联 ID 与时间线覆盖**所有入口**（含 ``/healthz``、``/metrics``、
+``/traces/*``），任何请求事后都能按关联 ID 查到自己的时间线；
+但 ``/healthz``、``/metrics``、``/traces/*`` 等平台端点仍不纳入
+业务指标与访问日志（口径与上一轮一致）。
 """
 
 from __future__ import annotations
@@ -30,24 +34,30 @@ from app.context import (
 )
 from app.logging_setup import flatten_exception_chain, get_logger, mask_headers
 from app.metrics import metrics
+from app.tracing import trace_store
 
 logger = get_logger("app.access")
 
-# 不纳入业务指标/访问日志的平台路径
+# 不纳入业务指标/访问日志的平台路径（时间线仍然记录）
 _SKIP_PATHS = frozenset({"/healthz", "/metrics"})
 
 
+def _is_platform_path(path: str) -> bool:
+    return path in _SKIP_PATHS or path.startswith("/traces")
+
+
 class ObservabilityMiddleware(BaseHTTPMiddleware):
-    """关联 ID + 结构化访问日志 + 指标的一体化中间件。"""
+    """关联 ID + 时间线 + 结构化访问日志 + 指标的一体化中间件。"""
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path in _SKIP_PATHS:
-            return await call_next(request)
-
         inbound = request.headers.get(CORRELATION_ID_HEADER)
         correlation_id, token = bind_correlation_id(inbound)
         start = time.perf_counter()
-        metrics.inc_inflight()
+        trace_store.begin(correlation_id, request.method, request.url.path)
+
+        platform = _is_platform_path(request.url.path)
+        if not platform:
+            metrics.inc_inflight()
         status_code = 500
         error_type: str | None = None
 
@@ -86,25 +96,33 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
             return response
         finally:
             duration = time.perf_counter() - start
-            metrics.dec_inflight()
-            # 路由模板（/items/{id}）优先，取不到时退回原始路径
-            route = request.scope.get("route")
-            route_path = getattr(route, "path", request.url.path)
-            metrics.record_request(
-                method=request.method,
-                path=route_path,
+            if not platform:
+                metrics.dec_inflight()
+                # 路由模板（/items/{id}）优先，取不到时退回原始路径
+                route = request.scope.get("route")
+                route_path = getattr(route, "path", request.url.path)
+                metrics.record_request(
+                    method=request.method,
+                    path=route_path,
+                    status_code=status_code,
+                    duration=duration,
+                    error_type=error_type,
+                )
+                logger.info(
+                    "request completed",
+                    extra={
+                        "method": request.method,
+                        "path": route_path,
+                        "status_code": status_code,
+                        "duration_ms": round(duration * 1000, 3),
+                        "error_type": error_type,
+                    },
+                )
+            # 时间线对所有入口落定汇总；访问日志/指标仍只覆盖业务入口
+            trace_store.finish(
+                correlation_id,
                 status_code=status_code,
-                duration=duration,
                 error_type=error_type,
-            )
-            logger.info(
-                "request completed",
-                extra={
-                    "method": request.method,
-                    "path": route_path,
-                    "status_code": status_code,
-                    "duration_ms": round(duration * 1000, 3),
-                    "error_type": error_type,
-                },
+                duration=duration,
             )
             reset_correlation_id(token)

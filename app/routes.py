@@ -14,9 +14,30 @@ from fastapi.responses import JSONResponse
 from app.context import CORRELATION_ID_HEADER, get_correlation_id
 from app.logging_setup import get_logger
 from app.metrics import metrics
+from app.tracing import trace_store
 
 router = APIRouter()
 logger = get_logger("app.routes")
+
+
+@router.get("/traces/{correlation_id}", tags=["observability"])
+async def get_trace(correlation_id: str) -> JSONResponse:
+    """按关联 ID 取回该请求的事后时间线。
+
+    命中时返回 ``found: true`` 及完整时间线（开始/结束/总耗时/最终状态码/
+    错误类型 + 有序事件列表）；从未出现或已因容量超限被淘汰的 ID 返回
+    HTTP 200 + ``found: false``，与正常结果明确区分，不作为错误处理。
+    """
+    trace = trace_store.get(correlation_id)
+    if trace is None:
+        return JSONResponse(
+            {
+                "found": False,
+                "correlation_id": correlation_id,
+                "reason": "unknown_or_evicted",
+            }
+        )
+    return JSONResponse({"found": True, **trace})
 
 
 @router.get("/healthz", tags=["observability"])

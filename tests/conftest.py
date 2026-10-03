@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from app.logging_setup import CorrelationFilter, JsonFormatter
 from app.main import app
 from app.metrics import metrics
+from app.tracing import trace_store
 
 
 class _JsonCaptureHandler(logging.Handler):
@@ -50,12 +51,15 @@ def caplogs() -> Iterator[list[dict]]:
 @pytest.fixture
 def client() -> Iterator[TestClient]:
     metrics.reset()
-    # 测试期间静默控制台 JSON 流（caplogs 用独立 handler，不受影响），
-    # 让 pytest 的用例进度输出保持清晰；用例结束后恢复。
+    trace_store.reset()
+    # 测试期间静默控制台 JSON 流（只压 StreamHandler；TraceCaptureHandler
+    # 等内存态 handler 保持生效，时间线归档不受静默影响）。
     root = logging.getLogger()
-    saved_levels = [(h, h.level) for h in root.handlers]
+    saved_levels = [
+        (h, h.level) for h in root.handlers if isinstance(h, logging.StreamHandler)
+    ]
     for h, _ in saved_levels:
-        h.setLevel(logging.CRITICAL + 1)  # 测试期间静默控制台 JSON 流
+        h.setLevel(logging.CRITICAL + 1)
     try:
         with TestClient(app) as c:
             yield c
