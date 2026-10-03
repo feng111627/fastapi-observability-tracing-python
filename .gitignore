@@ -7,3 +7,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地手工启动服务的临时输出
+.tmp/

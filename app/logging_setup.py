@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from app.context import get_correlation_id
+from app.tracing import level_name, record_extra_fields, trace_store
 
 # 命中即需要脱敏的请求头（小写匹配；authorization 同时覆盖 bearer token）
 SENSITIVE_HEADERS = frozenset(
@@ -85,6 +86,8 @@ class CorrelationFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # 只放行 app 命名空间的业务日志，第三方/服务器框架日志不进入这条
+        # JSON 流（uvicorn 的日志在 configure_logging 中单独接 JSON handler）
         if record.name != "app" and not record.name.startswith("app."):
             return False
         record.correlation_id = get_correlation_id()
@@ -93,6 +96,58 @@ class CorrelationFilter(logging.Filter):
         record.status_code = getattr(record, "status_code", None)
         record.duration_ms = getattr(record, "duration_ms", None)
         return True
+
+
+class _ContextDefaultsFilter(logging.Filter):
+    """与 :class:`CorrelationFilter` 相同的默认字段注入，但不限制 logger 名。
+
+    用于挂在 uvicorn 等框架 logger 上，使框架日志同样具备时间线/JSON
+    渲染所需的稳定字段（缺失时给默认值，绝不因字段缺失而报错）。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.correlation_id = getattr(record, "correlation_id", "") or (
+            get_correlation_id()
+        )
+        record.method = getattr(record, "method", "")
+        record.path = getattr(record, "path", "")
+        record.status_code = getattr(record, "status_code", None)
+        record.duration_ms = getattr(record, "duration_ms", None)
+        return True
+
+
+class TimelineHandler(logging.Handler):
+    """旁路 handler：把每条 ``app.*`` 日志实时追加到请求时间线。
+
+    - 归属完全由当前上下文的关联 ID 决定（后台任务线程拷贝了 context，
+      因此后台日志自动归到发起请求的时间线下）；
+    - 时间线已淘汰或不存在（脱离请求上下文的日志）时静默丢弃，存储是
+      旁路，绝不能反过来影响实时日志；
+    - 这里只保留轻量字段（级别/消息/来源组件/extra 结构化字段），
+      完整异常链 traceback 仍只走实时 JSON 日志，避免时间线膨胀。
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            cid = getattr(record, "correlation_id", "") or get_correlation_id()
+            if not cid:
+                return
+            fields = record_extra_fields(record)
+            if record.exc_info:
+                exc = record.exc_info[1]
+                fields["exc_type"] = (
+                    f"{type(exc).__module__}.{type(exc).__qualname__}"
+                )
+                fields["exc_message"] = str(exc)
+            trace_store.add_event(
+                cid,
+                level_name(record.levelno),
+                record.getMessage(),
+                record.name,
+                fields=fields,
+            )
+        except Exception:  # noqa: BLE001 - 旁路失败绝不能影响请求
+            self.handleError(record)
 
 
 class JsonFormatter(logging.Formatter):
@@ -106,11 +161,11 @@ class JsonFormatter(logging.Formatter):
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
-            "correlation_id": record.correlation_id,
-            "method": record.method,
-            "path": record.path,
-            "status_code": record.status_code,
-            "duration_ms": record.duration_ms,
+            "correlation_id": getattr(record, "correlation_id", ""),
+            "method": getattr(record, "method", ""),
+            "path": getattr(record, "path", ""),
+            "status_code": getattr(record, "status_code", None),
+            "duration_ms": getattr(record, "duration_ms", None),
         }
         if record.exc_info:
             payload["exc_chain"] = flatten_exception_chain(record.exc_info[1])
@@ -134,16 +189,47 @@ _RESERVED_RECORD_KEYS = frozenset(
 
 
 def configure_logging(level: int = logging.INFO) -> None:
-    """配置根 logger：JSON 输出到 stdout，全进程只配置一次。"""
+    """配置进程内日志：全部输出为统一的单行 JSON 到 stdout。
+
+    - ``app.*`` 业务日志：经 :class:`CorrelationFilter` 注入关联 ID 等
+      字段，同时旁路一份到 :class:`TimelineHandler` 进入请求时间线；
+    - ``uvicorn`` / ``uvicorn.error`` / ``uvicorn.access`` 等框架日志：
+      同样接管为 JSON 格式，保证本地服务输出里不再混入格式不一致的
+      明文行（uvicorn 自带的明文访问日志直接关闭，访问口径以本服务
+      自己的结构化 ``request completed`` 为准）；
+    - 全进程只配置一次，重复调用仅调整级别。
+    """
     root = logging.getLogger()
     if getattr(root, "_obs_configured", False):
         root.setLevel(level)
         return
-    handler = logging.StreamHandler(sys.stdout)
-    handler.addFilter(CorrelationFilter())
-    handler.setFormatter(JsonFormatter())
-    root.addHandler(handler)
+
+    json_handler = logging.StreamHandler(sys.stdout)
+    json_handler.addFilter(CorrelationFilter())
+    json_handler.setFormatter(JsonFormatter())
+
+    timeline_handler = TimelineHandler()
+    timeline_handler.addFilter(CorrelationFilter())
+
+    root.addHandler(json_handler)
+    root.addHandler(timeline_handler)
     root.setLevel(level)
+
+    # 接管 uvicorn 框架日志：统一 JSON，关闭其自带的明文 handler，
+    # 并禁止向 root 传播，避免同一条框架日志输出两遍。
+    defaults = _ContextDefaultsFilter()
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        framework_logger = logging.getLogger(name)
+        handler = logging.StreamHandler(sys.stdout)
+        handler.addFilter(defaults)
+        handler.setFormatter(JsonFormatter())
+        framework_logger.handlers = [handler]
+        framework_logger.propagate = False
+        framework_logger.setLevel(level)
+    # uvicorn 自带的明文访问行直接丢弃：本服务的结构化访问日志
+    # （app.access / request completed）已是统一且更丰富的访问口径。
+    logging.getLogger("uvicorn.access").disabled = True
+
     root._obs_configured = True  # type: ignore[attr-defined]
 
 

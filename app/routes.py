@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from app.context import CORRELATION_ID_HEADER, get_correlation_id
 from app.logging_setup import get_logger
 from app.metrics import metrics
+from app.tracing import trace_store
 
 router = APIRouter()
 logger = get_logger("app.routes")
@@ -29,6 +30,48 @@ async def healthz() -> dict[str, str]:
 async def metrics_snapshot() -> JSONResponse:
     """以 JSON 导出请求总数、错误数、耗时分布、进行中请求数。"""
     return JSONResponse(metrics.snapshot())
+
+
+@router.get("/traces/stats", tags=["observability"])
+async def trace_store_stats() -> JSONResponse:
+    """时间线存储自身状态：容量、保留时长、当前占用、已淘汰墓碑数。"""
+    return JSONResponse(trace_store.stats())
+
+
+@router.get("/traces/{correlation_id}", tags=["observability"])
+async def get_trace(correlation_id: str) -> JSONResponse:
+    """按关联 ID 取回一条请求的完整时间线（事后可回溯）。
+
+    返回分三种、互不混淆：
+    - ``200``：命中，``status`` 为 ``completed`` / ``error`` /
+      ``in_flight``（请求仍在处理中时也能看到当前已发生的事件）；
+    - ``404``：该关联 ID **从未出现过**；
+    - ``410 Gone``：该 ID 曾经存在，但因超出容量或保留时长已被淘汰。
+
+    查不到时返回结构化 JSON 而不是抛错，调用方可以据此区分处理。
+    """
+    status, payload = trace_store.get_timeline(correlation_id)
+    if status == "found":
+        return JSONResponse(payload)
+    if status == "evicted":
+        return JSONResponse(
+            status_code=410,
+            content={
+                "error": "trace_evicted",
+                "correlation_id": correlation_id,
+                "detail": (
+                    "该关联 ID 的时间线曾经存在，但已因超出容量或保留时长被淘汰"
+                ),
+            },
+        )
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": "trace_not_found",
+            "correlation_id": correlation_id,
+            "detail": "未找到该关联 ID 的时间线（本进程从未记录过该 ID）",
+        },
+    )
 
 
 @router.get("/", tags=["demo"])
