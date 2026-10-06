@@ -4,17 +4,21 @@
 1. 从入站 ``X-Correlation-ID`` 头沿用关联 ID，缺失则生成；
 2. 绑定到当前 :class:`contextvars.ContextVar`（响应头原样回传，
    后台任务/异步并发自动拷贝上下文，不串号）；
-3. 在 :data:`app.tracing.trace_store` 开立本条关联 ID 的时间线，
-   处理期间的日志事件由日志管道自动归档进去；
+3. 在 :data:`app.tracing.trace_store` 开立本条关联 ID 的时间线
+   （``/traces/*`` 查询除外，见下），处理期间的日志事件由日志管道
+   自动归档进去；
 4. 业务请求：进行中请求数 +1，记录开始时间；
 5. 调用下游；抛出的未处理异常在此记录**完整异常链**与脱敏请求头，并兜底
    生成带关联 ID 的 JSON 500 响应（新版 Starlette 异常会穿透 call_next）；
 6. 无论成功失败都：业务请求做指标与访问日志，随后落定时间线的
    状态码/错误类型/总耗时，最后恢复上下文。
 
-关联 ID 与时间线覆盖**所有入口**（含 ``/healthz``、``/metrics``、
-``/traces/*``），任何请求事后都能按关联 ID 查到自己的时间线；
-但 ``/healthz``、``/metrics``、``/traces/*`` 等平台端点仍不纳入
+关联 ID 绑定与响应头回传覆盖**所有入口**；时间线记录覆盖除
+``/traces/*`` 查询外的所有入口（含 ``/healthz``、``/metrics``），
+任何请求事后都能按关联 ID 查到自己的时间线。``/traces/*`` 查询是
+**纯读取**：不为查询请求自身开立、重置或覆盖任何时间线，否则「带着
+某条请求的关联 ID 去查它自己」会把那条时间线当场冲掉。但
+``/healthz``、``/metrics``、``/traces/*`` 等平台端点仍不纳入
 业务指标与访问日志（口径与上一轮一致）。
 """
 
@@ -46,6 +50,11 @@ def _is_platform_path(path: str) -> bool:
     return path in _SKIP_PATHS or path.startswith("/traces")
 
 
+def _is_trace_query(path: str) -> bool:
+    """时间线查询入口：纯读取，绝不为查询自身开立/重置/落定时间线。"""
+    return path.startswith("/traces")
+
+
 class ObservabilityMiddleware(BaseHTTPMiddleware):
     """关联 ID + 时间线 + 结构化访问日志 + 指标的一体化中间件。"""
 
@@ -53,7 +62,10 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
         inbound = request.headers.get(CORRELATION_ID_HEADER)
         correlation_id, token = bind_correlation_id(inbound)
         start = time.perf_counter()
-        trace_store.begin(correlation_id, request.method, request.url.path)
+        # 查询请求自身的关联 ID 不得影响已归档的时间线（纯读取语义）
+        trace_query = _is_trace_query(request.url.path)
+        if not trace_query:
+            trace_store.begin(correlation_id, request.method, request.url.path)
 
         platform = _is_platform_path(request.url.path)
         if not platform:
@@ -118,11 +130,12 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
                         "error_type": error_type,
                     },
                 )
-            # 时间线对所有入口落定汇总；访问日志/指标仍只覆盖业务入口
-            trace_store.finish(
-                correlation_id,
-                status_code=status_code,
-                error_type=error_type,
-                duration=duration,
-            )
+            # 时间线对除查询外的所有入口落定汇总；访问日志/指标仍只覆盖业务入口
+            if not trace_query:
+                trace_store.finish(
+                    correlation_id,
+                    status_code=status_code,
+                    error_type=error_type,
+                    duration=duration,
+                )
             reset_correlation_id(token)

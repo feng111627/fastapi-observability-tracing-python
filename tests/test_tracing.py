@@ -152,9 +152,11 @@ def test_store_event_ordering_under_thread_contention() -> None:
     snap = store.get("race")
     assert snap is not None
     total = n_threads * n_events
-    assert snap["event_count"] == total
+    # begin 已写入一条「请求进入」结构事件（seq=1），业务事件紧随其后
+    assert snap["event_count"] == total + 1
+    assert snap["events"][0]["event_kind"] == "request_started"
     seqs = [e["seq"] for e in snap["events"]]
-    assert seqs == list(range(1, total + 1))  # 连续无洞无重
+    assert seqs == list(range(1, total + 2))  # 连续无洞无重
     offsets = [e["offset_ms"] for e in snap["events"]]
     assert offsets == sorted(offsets)
 
@@ -168,7 +170,7 @@ def test_eviction_oldest_first(client, trace_limits) -> None:
     for cid in ("tl-cap-1", "tl-cap-2", "tl-cap-3"):
         client.get("/", headers={HEADER: cid})
 
-    # 直接查存储（HTTP 查询自身也会开立时间线，小容量下会干扰断言）
+    # 直接查存储（HTTP 查询虽已不再开立时间线，直查存储的断言更直白）
     assert trace_store.get("tl-cap-1") is None  # 最旧被淘汰
     assert trace_store.get("tl-cap-2") is not None
     assert trace_store.get("tl-cap-3") is not None
@@ -179,22 +181,36 @@ def test_eviction_oldest_first(client, trace_limits) -> None:
 
 
 def test_per_trace_event_cap(client, trace_limits) -> None:
-    """单条时间线事件数超上限后停止追加并标记 truncated，内存有界。"""
+    """单条时间线业务事件数超上限后停止追加并标记 truncated，内存有界。
+
+    首/尾结构事件不占业务事件上限：即使业务事件被截断，请求的入口与
+    结束记录也始终完整。
+    """
     trace_store.configure(max_events_per_trace=1)
     client.get("/items/1", headers={HEADER: "tl-trunc"})
     body = client.get("/traces/tl-trunc").json()
     assert body["found"] is True
-    assert body["event_count"] == 1
     assert body["truncated"] is True
+    kinds = [e.get("event_kind") for e in body["events"]]
+    # 首条是「请求进入」，末条是「请求结束」，中间只保留了 1 条业务事件
+    assert kinds[0] == "request_started"
+    assert kinds[-1] == "request_finished"
+    business = [e for e in body["events"] if "event_kind" not in e]
+    assert len(business) == 1
+    assert business[0]["message"] == "fetching item"
+    assert body["event_count"] == 3
 
 
 def test_ttl_expiry(client, trace_limits) -> None:
-    """超过保留时长的时间线被清理，再查返回 found: false。"""
+    """超过保留时长的时间线被清理，再查返回 found:false + evicted_by:ttl。"""
     trace_store.configure(ttl_seconds=0.05)
     client.get("/", headers={HEADER: "tl-ttl"})
     assert client.get("/traces/tl-ttl").json()["found"] is True
     time.sleep(0.1)
-    assert client.get("/traces/tl-ttl").json()["found"] is False
+    body = client.get("/traces/tl-ttl").json()
+    assert body["found"] is False
+    assert body["reason"] == "evicted"
+    assert body["evicted_by"] == "ttl"
 
 
 def test_events_dropped_after_eviction(client, trace_limits) -> None:
@@ -224,24 +240,29 @@ def test_reused_id_starts_fresh_timeline(client) -> None:
 
 
 def test_unknown_id_returns_distinguishable_not_found(client) -> None:
-    """从未出现过的 ID：HTTP 200 + found:false，与正常结果明确区分。"""
+    """从未出现过的 ID：HTTP 200 + found:false + reason:unknown。"""
     resp = client.get("/traces/never-existed")
     assert resp.status_code == 200
     body = resp.json()
     assert body["found"] is False
     assert body["correlation_id"] == "never-existed"
-    assert body["reason"] == "unknown_or_evicted"
+    assert body["reason"] == "unknown"
+    assert "evicted_by" not in body
     assert "events" not in body  # 不伪装成一条空时间线
 
 
 def test_evicted_id_returns_not_found(client, trace_limits) -> None:
-    """因超限被淘汰的 ID 与从未出现过的返回同一种清晰的未命中。"""
+    """因容量超限被淘汰的 ID：found:false + reason:evicted + evicted_by:capacity。"""
     trace_store.configure(max_traces=1)
     client.get("/", headers={HEADER: "tl-victim"})
     client.get("/", headers={HEADER: "tl-survivor"})
-    body = client.get("/traces/tl-victim").json()
+    resp = client.get("/traces/tl-victim")
+    assert resp.status_code == 200
+    body = resp.json()
     assert body["found"] is False
-    assert body["reason"] == "unknown_or_evicted"
+    assert body["reason"] == "evicted"
+    assert body["evicted_by"] == "capacity"
+    assert "events" not in body
 
 
 def test_query_does_not_create_trace(client) -> None:

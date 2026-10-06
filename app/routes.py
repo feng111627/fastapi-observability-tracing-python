@@ -25,18 +25,29 @@ async def get_trace(correlation_id: str) -> JSONResponse:
     """按关联 ID 取回该请求的事后时间线。
 
     命中时返回 ``found: true`` 及完整时间线（开始/结束/总耗时/最终状态码/
-    错误类型 + 有序事件列表）；从未出现或已因容量超限被淘汰的 ID 返回
-    HTTP 200 + ``found: false``，与正常结果明确区分，不作为错误处理。
+    错误类型 + 有序事件列表）。查询是**纯读取**：命中即把当时那一整份
+    记录原样返回，绝不因查询请求自身的关联 ID 而新建、重置或覆盖任何
+    已有记录。
+
+    未命中（HTTP 200，``found: false``，不作为错误处理）区分两种原因，
+    且都不伪装成一条空时间线（不带 ``events``）：
+
+    - ``reason: "unknown"``：该 ID 从未出现过（这个请求根本没到过这里）；
+    - ``reason: "evicted"``：该 ID 的时间线存在过，但已因容量上限或保留
+      时长被清掉，``evicted_by`` 进一步标明是 ``"capacity"``（条数超限
+      挤出）还是 ``"ttl"``（过期清理）。
     """
     trace = trace_store.get(correlation_id)
     if trace is None:
-        return JSONResponse(
-            {
-                "found": False,
-                "correlation_id": correlation_id,
-                "reason": "unknown_or_evicted",
-            }
-        )
+        evicted_by = trace_store.eviction_reason(correlation_id)
+        body: dict[str, object] = {
+            "found": False,
+            "correlation_id": correlation_id,
+            "reason": "evicted" if evicted_by else "unknown",
+        }
+        if evicted_by:
+            body["evicted_by"] = evicted_by
+        return JSONResponse(body)
     return JSONResponse({"found": True, **trace})
 
 
