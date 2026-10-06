@@ -84,3 +84,33 @@ def pytest_runtest_makereport(item: pytest.Item, call):
             )
         elif report.failed:
             print(f"✗ 用例失败: {item.nodeid}", flush=True)
+
+
+# 测试文件 -> 覆盖的业务域（用于结束时的汇总输出）
+_AREA_BY_MODULE = {
+    "test_correlation": "关联 ID（沿用/生成、并发与后台不串号）",
+    "test_exception_chain": "异常链与日志（完整链路、脱敏、字段）",
+    "test_metrics": "指标（并发计数、错误分类、直方图、进行中）",
+    "test_tracing": "事后时间线（首尾记录、纯读查询、淘汰、未命中区分）",
+}
+
+
+def pytest_terminal_summary(terminalreporter) -> None:
+    """会话结束时按业务域汇总各模块的用例数与通过情况。"""
+    stats = terminalreporter.stats
+    modules: dict[str, dict[str, int]] = {}
+    for status, key in (("passed", "passed"), ("failed", "failed"),
+                        ("error", "error"), ("skipped", "skipped")):
+        for report in stats.get(status, []):
+            module = report.nodeid.split("::")[0].rsplit("/", 1)[-1]
+            module = module.removesuffix(".py")
+            modules.setdefault(module, {}).setdefault(key, 0)
+            modules[module][key] += 1
+    print("\n===== 覆盖业务域汇总 =====", flush=True)
+    for module, counts in sorted(modules.items()):
+        area = _AREA_BY_MODULE.get(module, module)
+        parts = "，".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        total = sum(counts.values())
+        ok = counts.get("passed", 0)
+        mark = "✔" if ok == total else "✗"
+        print(f"{mark} {area}：{ok}/{total} 通过（{parts}）", flush=True)
